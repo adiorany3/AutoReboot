@@ -1,11 +1,11 @@
 #!/bin/sh
 # ==================================================
-# SMART MODEM WATCHDOG FINAL
-# OpenWrt + ModemManager + wwan0
+# SMART TETHERING WATCHDOG FINAL
+# OpenWrt + Ethernet Adapter tethering + wwan0
 #
 # Fungsi:
-# - Memulihkan tethering yang down
-# - Memulihkan wwan0 yang down
+# - Memulihkan interface tethering Type Ethernet Adapter
+# - Memulihkan device wwan0 yang down
 # - Memulihkan bearer ModemManager yang bengong
 # - Fallback ke ModemManager reset, AT+CFUN, USB reauthorize
 #
@@ -270,6 +270,59 @@ force_tethering_up() {
     fi
 
     return 0
+}
+
+
+renew_tethering() {
+    log "Stage 0: renew/up $NETIF Type=Ethernet Adapter Device=$PHYSDEV"
+
+    fix_uci_runtime
+
+    ubus call "network.interface.$NETIF" renew >/dev/null 2>&1 || true
+    sleep 2
+
+    ubus call "network.interface.$NETIF" up >/dev/null 2>&1 || true
+    ifup "$NETIF" 2>/dev/null || true
+
+    force_link_up "$PHYSDEV" "quiet" >/dev/null 2>&1 || true
+
+    wait_online 15
+}
+
+reboot_tethering() {
+    log "Stage 1: reboot $NETIF Type=Ethernet Adapter Device=$PHYSDEV"
+
+    fix_uci_runtime
+
+    # Turunkan logical interface OpenWrt.
+    ubus call "network.interface.$NETIF" down >/dev/null 2>&1 || true
+    ifdown "$NETIF" 2>/dev/null || true
+    sleep 2
+
+    # Turunkan dan naikkan ulang device wwan0.
+    if ip link show dev "$PHYSDEV" >/dev/null 2>&1; then
+        log "Stage 1: link down $PHYSDEV"
+        ip link set dev "$PHYSDEV" down 2>/dev/null || true
+        sleep 2
+
+        # Bersihkan IP lama agar DHCP/lease tidak nyangkut.
+        ip addr flush dev "$PHYSDEV" 2>/dev/null || true
+        sleep 1
+
+        log "Stage 1: link up $PHYSDEV"
+        ip link set dev "$PHYSDEV" up 2>/dev/null || true
+        sleep 2
+    else
+        log "Stage 1: device $PHYSDEV not found"
+    fi
+
+    # Naikkan logical interface lagi.
+    ubus call "network.interface.$NETIF" up >/dev/null 2>&1 || true
+    sleep 1
+
+    ifup "$NETIF" 2>/dev/null || true
+
+    wait_online 35
 }
 
 # ==================================================
@@ -661,9 +714,10 @@ run_time_sync() {
 }
 
 show_status() {
-    echo "=== MODEM WATCHDOG STATUS ==="
+    echo "=== TETHERING WATCHDOG STATUS ==="
     echo "NETIF       : $NETIF"
-    echo "PHYSDEV     : $PHYSDEV"
+    echo "TYPE        : Ethernet Adapter"
+    echo "DEVICE      : $PHYSDEV"
     echo "TTYDEV      : $TTYDEV"
     echo "L3DEV       : $(get_l3dev 2>/dev/null)"
     echo "FAIL COUNT  : $(get_fail_count)"
@@ -724,6 +778,11 @@ case "$1" in
         show_status
         exit 0
         ;;
+
+    --reboot-tethering)
+        reboot_tethering
+        exit $?
+        ;;
 esac
 
 # ==================================================
@@ -741,16 +800,22 @@ if check_connectivity; then
     exit 0
 fi
 
-log "Initial connectivity check failed"
+log "No connection detected on $NETIF/$PHYSDEV"
 
 # Tahap 1:
-# Recovery ringan langsung.
-# Ini berguna untuk kasus tethering/wwan0 down tanpa perlu deep recovery.
-force_tethering_up
-
-if wait_online 15; then
+# Karena interface di LuCI adalah Type=Ethernet Adapter Device=wwan0,
+# recovery utama adalah renew/up lalu reboot tethering.
+if renew_tethering; then
     rm -f "$STATEFILE" "$COOLDOWNFILE"
-    log "RECOVERED via quick force_tethering_up"
+    log "RECOVERED via renew_tethering"
+    run_time_sync
+    log "=== Watchdog cycle done ==="
+    exit 0
+fi
+
+if reboot_tethering; then
+    rm -f "$STATEFILE" "$COOLDOWNFILE"
+    log "RECOVERED via reboot_tethering"
     run_time_sync
     log "=== Watchdog cycle done ==="
     exit 0
@@ -762,7 +827,7 @@ FAIL="$(get_fail_count)"
 FAIL=$((FAIL + 1))
 echo "$FAIL" > "$STATEFILE"
 
-log "Connectivity failed $FAIL/$FAILS_REQUIRED"
+log "Connectivity failed $FAIL/$FAILS_REQUIRED after reboot_tethering"
 
 if [ "$FAIL" -lt "$FAILS_REQUIRED" ]; then
     log "Waiting next cycle before deep recovery"
