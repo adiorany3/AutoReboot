@@ -7,7 +7,7 @@
 # - Memulihkan tethering yang down
 # - Memulihkan wwan0 yang down
 # - Memulihkan bearer ModemManager yang bengong
-# - Fallback ke AT+CFUN dan USB reauthorize
+# - Fallback ke ModemManager reset, AT+CFUN, USB reauthorize
 #
 # Install:
 #   chmod +x /root/reboot.sh
@@ -18,6 +18,7 @@
 # ==================================================
 
 LOCKFILE="/tmp/modem-watchdog.lock"
+LOCKDIR="/tmp/modem-watchdog.lockdir"
 STATEFILE="/tmp/modem-watchdog.fail"
 COOLDOWNFILE="/tmp/modem-watchdog.cooldown"
 LOGFILE="/tmp/reboot.log"
@@ -33,20 +34,41 @@ SCRIPT="/root/reboot.sh"
 
 PING_TARGETS="1.1.1.1 8.8.8.8 104.17.3.81"
 
+# Cron tiap 1 menit.
+# Nilai 2 berarti deep recovery dimulai setelah gagal 2 kali berturut-turut.
 FAILS_REQUIRED=2
+
+# Cooldown deep recovery jika semua tahap gagal.
 COOLDOWN_SECONDS=180
+
+# Maksimal ukuran /tmp/reboot.log sebelum dikosongkan.
 MAX_LOG_SIZE=200000
 
 # ==================================================
 # LOCK
 # ==================================================
 
-exec 9>"$LOCKFILE"
+acquire_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$LOCKFILE"
 
-if ! flock -n 9; then
-    logger -t modem-watchdog "Already running, skipping"
-    exit 0
-fi
+        if ! flock -n 9; then
+            logger -t modem-watchdog "Already running, skipping"
+            exit 0
+        fi
+
+        return 0
+    fi
+
+    if ! mkdir "$LOCKDIR" 2>/dev/null; then
+        logger -t modem-watchdog "Already running, skipping"
+        exit 0
+    fi
+
+    trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT INT TERM
+}
+
+acquire_lock
 
 # ==================================================
 # LOGGING
@@ -59,6 +81,12 @@ log() {
 
     if [ -f "$LOGFILE" ]; then
         SIZE="$(wc -c < "$LOGFILE" 2>/dev/null || echo 0)"
+
+        case "$SIZE" in
+            ''|*[!0-9]*)
+                SIZE=0
+                ;;
+        esac
 
         if [ "$SIZE" -gt "$MAX_LOG_SIZE" ]; then
             : > "$LOGFILE"
@@ -256,17 +284,16 @@ ping_ok() {
     DEV="$(get_l3dev)"
 
     if [ -z "$DEV" ]; then
-        DEV="$PHYSDEV"
+        return 1
+    fi
+
+    if ! ip link show dev "$DEV" >/dev/null 2>&1; then
+        return 1
     fi
 
     for HOST in $PING_TARGETS; do
-        if ip link show dev "$DEV" >/dev/null 2>&1; then
-            ping -I "$DEV" -c 1 -W 1 "$HOST" >/dev/null 2>&1 \
-                && return 0
-        else
-            ping -c 1 -W 1 "$HOST" >/dev/null 2>&1 \
-                && return 0
-        fi
+        ping -I "$DEV" -c 1 -W 1 "$HOST" >/dev/null 2>&1 \
+            && return 0
     done
 
     return 1
@@ -284,7 +311,15 @@ wait_online() {
     I=0
 
     while [ "$I" -lt "$LIMIT" ]; do
-        force_link_up "$PHYSDEV" "quiet" >/dev/null 2>&1 || true
+        DEV="$(get_l3dev)"
+
+        if [ -n "$DEV" ]; then
+            force_link_up "$DEV" "quiet" >/dev/null 2>&1 || true
+        fi
+
+        if [ "$PHYSDEV" != "$DEV" ]; then
+            force_link_up "$PHYSDEV" "quiet" >/dev/null 2>&1 || true
+        fi
 
         if check_connectivity; then
             return 0
@@ -585,7 +620,11 @@ show_status() {
     echo
 
     echo "=== IFSTATUS $NETIF ==="
-    ifstatus "$NETIF" 2>/dev/null || echo "ifstatus failed"
+    if command -v ifstatus >/dev/null 2>&1; then
+        ifstatus "$NETIF" 2>/dev/null || echo "ifstatus failed"
+    else
+        echo "ifstatus not found"
+    fi
     echo
 
     echo "=== IP ADDR $PHYSDEV ==="
@@ -640,14 +679,32 @@ esac
 
 log "=== Watchdog check started ==="
 
-force_tethering_up
-
+# Tahap 0:
+# Jika koneksi masih sehat, jangan lakukan ifup/ubus up.
+# Ini mengurangi beban netifd, ModemManager, dan modem.
 if check_connectivity; then
     rm -f "$STATEFILE" "$COOLDOWNFILE"
     log "Connection healthy"
     exit 0
 fi
 
+log "Initial connectivity check failed"
+
+# Tahap 1:
+# Recovery ringan langsung.
+# Ini berguna untuk kasus tethering/wwan0 down tanpa perlu deep recovery.
+force_tethering_up
+
+if wait_online 15; then
+    rm -f "$STATEFILE" "$COOLDOWNFILE"
+    log "RECOVERED via quick force_tethering_up"
+    run_time_sync
+    log "=== Watchdog cycle done ==="
+    exit 0
+fi
+
+# Tahap 2:
+# Jika recovery ringan belum berhasil, baru hitung gagal berturut-turut.
 FAIL="$(get_fail_count)"
 FAIL=$((FAIL + 1))
 echo "$FAIL" > "$STATEFILE"
@@ -659,6 +716,8 @@ if [ "$FAIL" -lt "$FAILS_REQUIRED" ]; then
     exit 0
 fi
 
+# Tahap 3:
+# Cek cooldown agar modem tidak dihajar reset terus-menerus.
 NOW="$(date +%s)"
 LAST_COOLDOWN="$(get_last_cooldown)"
 
@@ -671,12 +730,11 @@ if [ "$LAST_COOLDOWN" -gt 0 ]; then
     fi
 fi
 
+# Tahap 4:
+# Deep recovery bertingkat.
 RECOVERED=0
 
-if force_tethering_up && wait_online 25; then
-    log "RECOVERED via force_tethering_up"
-    RECOVERED=1
-elif mm_recover; then
+if mm_recover; then
     log "RECOVERED via ModemManager disconnect/disable/enable"
     RECOVERED=1
 elif mm_daemon_restart; then
