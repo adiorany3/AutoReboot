@@ -45,6 +45,20 @@ COOLDOWN_SECONDS=180
 MAX_LOG_SIZE=200000
 
 # ==================================================
+# FINAL FALLBACK: REBOOT OPENWRT
+# ==================================================
+# 1 = aktifkan reboot router jika semua recovery gagal.
+# 0 = matikan fallback reboot router.
+ENABLE_ROUTER_REBOOT=1
+
+# Jangan reboot router jika uptime masih terlalu pendek.
+# Ini mencegah boot-loop saat modem/operator sedang bermasalah.
+MIN_UPTIME_BEFORE_REBOOT_SECONDS=600
+
+# Delay pendek sebelum perintah reboot dijalankan.
+ROUTER_REBOOT_DELAY_SECONDS=5
+
+# ==================================================
 # LOCK
 # ==================================================
 
@@ -574,6 +588,43 @@ network_service_restart() {
     wait_online 50
 }
 
+
+# ==================================================
+# ROUTER REBOOT FALLBACK
+# ==================================================
+
+get_uptime_seconds() {
+    awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0
+}
+
+router_reboot_fallback() {
+    if [ "$ENABLE_ROUTER_REBOOT" != "1" ]; then
+        log "Final fallback skipped: router reboot disabled"
+        return 1
+    fi
+
+    UPTIME="$(get_uptime_seconds)"
+
+    case "$UPTIME" in
+        ''|*[!0-9]*)
+            UPTIME=0
+            ;;
+    esac
+
+    if [ "$UPTIME" -lt "$MIN_UPTIME_BEFORE_REBOOT_SECONDS" ]; then
+        log "Final fallback skipped: uptime ${UPTIME}s is below minimum ${MIN_UPTIME_BEFORE_REBOOT_SECONDS}s"
+        return 1
+    fi
+
+    log "FINAL FALLBACK: all recovery failed, rebooting OpenWrt in ${ROUTER_REBOOT_DELAY_SECONDS}s"
+
+    sync
+    sleep "$ROUTER_REBOOT_DELAY_SECONDS"
+    /sbin/reboot
+
+    return 0
+}
+
 # ==================================================
 # STATE
 # ==================================================
@@ -617,6 +668,8 @@ show_status() {
     echo "L3DEV       : $(get_l3dev 2>/dev/null)"
     echo "FAIL COUNT  : $(get_fail_count)"
     echo "COOLDOWN    : $(get_last_cooldown)"
+    echo "UPTIME      : $(get_uptime_seconds)s"
+    echo "REBOOT FB   : $ENABLE_ROUTER_REBOOT"
     echo
 
     echo "=== IFSTATUS $NETIF ==="
@@ -758,6 +811,7 @@ elif network_service_restart; then
 else
     log "Still down after all recovery stages"
     echo "$NOW" > "$COOLDOWNFILE"
+    router_reboot_fallback || true
 fi
 
 if [ "$RECOVERED" -eq 1 ]; then
