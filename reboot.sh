@@ -1,26 +1,28 @@
 #!/bin/sh
 # ==================================================
-# SMART TETHERING WATCHDOG FINAL
-# OpenWrt + Ethernet Adapter tethering + wwan0
+# REBOOT.SH - OpenWrt Tethering Watchdog
+# Interface : tethering
+# Type      : Ethernet Adapter
+# Device    : wwan0
 #
 # Fungsi:
-# - Memulihkan interface tethering Type Ethernet Adapter
-# - Memulihkan device wwan0 yang down
-# - Memulihkan bearer ModemManager yang bengong
-# - Fallback ke ModemManager reset, AT+CFUN, USB reauthorize
+# - Mengecek koneksi internet lewat tethering/wwan0.
+# - Jika tidak ada koneksi, reboot interface tethering.
+# - Jika masih gagal, reset ModemManager / AT / USB.
+# - Proses terakhir: reboot OpenWrt dengan pengaman uptime.
 #
-# Install:
+# Install cron:
 #   chmod +x /root/reboot.sh
-#   sh /root/reboot.sh --install-cron
+#   /bin/sh /root/reboot.sh --install-cron
 #
-# Cron:
-#   * * * * sh /root/reboot.sh
+# Cron yang benar:
+#   * * * * * /bin/sh /root/reboot.sh >> /tmp/reboot-cron.err 2>&1
 # ==================================================
 
-LOCKFILE="/tmp/modem-watchdog.lock"
-LOCKDIR="/tmp/modem-watchdog.lockdir"
-STATEFILE="/tmp/modem-watchdog.fail"
-COOLDOWNFILE="/tmp/modem-watchdog.cooldown"
+LOCKFILE="/tmp/tethering-watchdog.lock"
+LOCKDIR="/tmp/tethering-watchdog.lockdir"
+STATEFILE="/tmp/tethering-watchdog.fail"
+COOLDOWNFILE="/tmp/tethering-watchdog.cooldown"
 LOGFILE="/tmp/reboot.log"
 
 # ==================================================
@@ -34,28 +36,12 @@ SCRIPT="/root/reboot.sh"
 
 PING_TARGETS="1.1.1.1 8.8.8.8 104.17.3.81"
 
-# Cron tiap 1 menit.
-# Nilai 2 berarti deep recovery dimulai setelah gagal 2 kali berturut-turut.
 FAILS_REQUIRED=2
-
-# Cooldown deep recovery jika semua tahap gagal.
 COOLDOWN_SECONDS=180
-
-# Maksimal ukuran /tmp/reboot.log sebelum dikosongkan.
 MAX_LOG_SIZE=200000
 
-# ==================================================
-# FINAL FALLBACK: REBOOT OPENWRT
-# ==================================================
-# 1 = aktifkan reboot router jika semua recovery gagal.
-# 0 = matikan fallback reboot router.
 ENABLE_ROUTER_REBOOT=1
-
-# Jangan reboot router jika uptime masih terlalu pendek.
-# Ini mencegah boot-loop saat modem/operator sedang bermasalah.
 MIN_UPTIME_BEFORE_REBOOT_SECONDS=600
-
-# Delay pendek sebelum perintah reboot dijalankan.
 ROUTER_REBOOT_DELAY_SECONDS=5
 
 # ==================================================
@@ -67,7 +53,7 @@ acquire_lock() {
         exec 9>"$LOCKFILE"
 
         if ! flock -n 9; then
-            logger -t modem-watchdog "Already running, skipping"
+            logger -t tethering-watchdog "Already running, skipping"
             exit 0
         fi
 
@@ -75,7 +61,7 @@ acquire_lock() {
     fi
 
     if ! mkdir "$LOCKDIR" 2>/dev/null; then
-        logger -t modem-watchdog "Already running, skipping"
+        logger -t tethering-watchdog "Already running, skipping"
         exit 0
     fi
 
@@ -91,7 +77,7 @@ acquire_lock
 log() {
     MSG="$*"
 
-    logger -t modem-watchdog "$MSG"
+    logger -t tethering-watchdog "$MSG"
 
     if [ -f "$LOGFILE" ]; then
         SIZE="$(wc -c < "$LOGFILE" 2>/dev/null || echo 0)"
@@ -111,7 +97,129 @@ log() {
 }
 
 # ==================================================
-# UCI / CRON
+# CRON INSTALLER - KHUSUS OPENWRT
+# ==================================================
+
+install_cron() {
+    CRON_FILE="/etc/crontabs/root"
+    TMP_FILE="/tmp/root.cron.$$"
+    CRON_ENTRY="* * * * * /bin/sh $SCRIPT >> /tmp/reboot-cron.err 2>&1"
+
+    mkdir -p /etc/crontabs
+
+    if [ -f "$CRON_FILE" ]; then
+        grep -Fv "$SCRIPT" "$CRON_FILE" \
+            | grep -v "cron-test.log" \
+            > "$TMP_FILE" 2>/dev/null || true
+    else
+        : > "$TMP_FILE"
+    fi
+
+    echo "$CRON_ENTRY" >> "$TMP_FILE"
+
+    # Bersihkan baris kosong berlebih.
+    sed -i '/^[[:space:]]*$/d' "$TMP_FILE" 2>/dev/null || true
+
+    cp "$TMP_FILE" "$CRON_FILE"
+    rm -f "$TMP_FILE"
+
+    chmod 600 "$CRON_FILE"
+
+    if [ -x /etc/init.d/cron ]; then
+        /etc/init.d/cron enable >/dev/null 2>&1 || true
+        /etc/init.d/cron restart >/dev/null 2>&1 || true
+    fi
+
+    # Fallback jika init script tidak menjalankan crond.
+    if ! ps w | grep '[c]rond' >/dev/null 2>&1; then
+        if [ -x /usr/sbin/crond ]; then
+            /usr/sbin/crond -c /etc/crontabs -l 5 >/dev/null 2>&1 || true
+        elif command -v crond >/dev/null 2>&1; then
+            crond -c /etc/crontabs -l 5 >/dev/null 2>&1 || true
+        fi
+    fi
+
+    fix_uci_persistent
+
+    log "Cron installed correctly: $CRON_ENTRY"
+}
+
+cron_status() {
+    echo "=== /etc/crontabs/root ==="
+    if [ -f /etc/crontabs/root ]; then
+        cat /etc/crontabs/root
+    else
+        echo "Not found"
+    fi
+
+    echo
+    echo "=== crond process ==="
+    ps w | grep '[c]rond' || echo "crond not running"
+
+    echo
+    echo "=== cron service ==="
+    if [ -x /etc/init.d/cron ]; then
+        /etc/init.d/cron enabled && echo "cron enabled" || echo "cron not enabled"
+        /etc/init.d/cron status 2>/dev/null || true
+    else
+        echo "/etc/init.d/cron not found"
+    fi
+
+    echo
+    echo "=== recent cron log ==="
+    logread 2>/dev/null | grep -i cron | tail -n 30
+}
+
+install_cron_test() {
+    CRON_FILE="/etc/crontabs/root"
+    TMP_FILE="/tmp/root.cron.test.$$"
+    TEST_ENTRY="* * * * * /bin/date >> /tmp/cron-test.log 2>&1"
+
+    mkdir -p /etc/crontabs
+
+    if [ -f "$CRON_FILE" ]; then
+        grep -v "cron-test.log" "$CRON_FILE" > "$TMP_FILE" 2>/dev/null || true
+    else
+        : > "$TMP_FILE"
+    fi
+
+    echo "$TEST_ENTRY" >> "$TMP_FILE"
+
+    sed -i '/^[[:space:]]*$/d' "$TMP_FILE" 2>/dev/null || true
+
+    cp "$TMP_FILE" "$CRON_FILE"
+    rm -f "$TMP_FILE"
+
+    chmod 600 "$CRON_FILE"
+
+    if [ -x /etc/init.d/cron ]; then
+        /etc/init.d/cron enable >/dev/null 2>&1 || true
+        /etc/init.d/cron restart >/dev/null 2>&1 || true
+    fi
+
+    log "Cron test installed: $TEST_ENTRY"
+}
+
+remove_cron_test() {
+    CRON_FILE="/etc/crontabs/root"
+    TMP_FILE="/tmp/root.cron.clean.$$"
+
+    if [ -f "$CRON_FILE" ]; then
+        grep -v "cron-test.log" "$CRON_FILE" > "$TMP_FILE" 2>/dev/null || true
+        cp "$TMP_FILE" "$CRON_FILE"
+        rm -f "$TMP_FILE"
+        chmod 600 "$CRON_FILE"
+    fi
+
+    if [ -x /etc/init.d/cron ]; then
+        /etc/init.d/cron restart >/dev/null 2>&1 || true
+    fi
+
+    log "Cron test removed"
+}
+
+# ==================================================
+# UCI
 # ==================================================
 
 fix_uci_runtime() {
@@ -134,9 +242,6 @@ fix_uci_persistent() {
 
     DISABLED="$(uci -q get "network.$NETIF.disabled" 2>/dev/null)"
     AUTO="$(uci -q get "network.$NETIF.auto" 2>/dev/null)"
-    FORCE="$(uci -q get "network.$NETIF.force_connection" 2>/dev/null)"
-    SIGNAL="$(uci -q get "network.$NETIF.signalrate" 2>/dev/null)"
-    IP_TYPE="$(uci -q get "network.$NETIF.iptype" 2>/dev/null)"
 
     if [ "$DISABLED" = "1" ]; then
         uci -q delete "network.$NETIF.disabled" 2>/dev/null || true
@@ -148,21 +253,6 @@ fix_uci_persistent() {
         CHANGED=1
     fi
 
-    if [ "$FORCE" != "1" ]; then
-        uci -q set "network.$NETIF.force_connection=1" 2>/dev/null || true
-        CHANGED=1
-    fi
-
-    if [ "$SIGNAL" != "15" ]; then
-        uci -q set "network.$NETIF.signalrate=15" 2>/dev/null || true
-        CHANGED=1
-    fi
-
-    if [ "$IP_TYPE" != "ipv4" ]; then
-        uci -q set "network.$NETIF.iptype=ipv4" 2>/dev/null || true
-        CHANGED=1
-    fi
-
     if [ "$CHANGED" -eq 1 ]; then
         uci commit network
         log "Persistent UCI config updated for $NETIF"
@@ -171,30 +261,13 @@ fix_uci_persistent() {
     fi
 }
 
-install_cron() {
-    CRON_ENTRY="* * * * sh $SCRIPT"
-
-    crontab -l 2>/dev/null \
-        | grep -Fv "$SCRIPT" \
-        > /tmp/modem-cron.tmp
-
-    echo "$CRON_ENTRY" >> /tmp/modem-cron.tmp
-
-    crontab /tmp/modem-cron.tmp
-    rm -f /tmp/modem-cron.tmp
-
-    fix_uci_persistent
-
-    log "Cron installed: every 1 minute"
-}
-
 reset_state() {
     rm -f "$STATEFILE" "$COOLDOWNFILE"
     log "State reset"
 }
 
 # ==================================================
-# DEVICE DETECTION
+# DEVICE / CONNECTIVITY
 # ==================================================
 
 get_l3dev() {
@@ -228,106 +301,16 @@ get_l3dev() {
     return 1
 }
 
-force_link_up() {
+link_up_quiet() {
     DEV="$1"
-    QUIET="$2"
 
-    if [ -z "$DEV" ]; then
-        return 1
-    fi
+    [ -n "$DEV" ] || return 1
 
-    if ip link show dev "$DEV" >/dev/null 2>&1; then
-        if [ "$QUIET" != "quiet" ]; then
-            log "Force link up: $DEV"
-        fi
-
-        ip link set dev "$DEV" up 2>/dev/null || true
-        return 0
-    fi
-
-    return 1
-}
-
-force_tethering_up() {
-    log "Force bringing up logical interface: $NETIF"
-
-    fix_uci_runtime
-
-    ubus call "network.interface.$NETIF" up >/dev/null 2>&1 || true
-    sleep 1
-
-    ifup "$NETIF" 2>/dev/null || true
-    sleep 2
-
-    DEV="$(get_l3dev)"
-
-    if [ -n "$DEV" ]; then
-        force_link_up "$DEV"
-    fi
-
-    if [ "$PHYSDEV" != "$DEV" ]; then
-        force_link_up "$PHYSDEV"
-    fi
+    ip link show dev "$DEV" >/dev/null 2>&1 || return 1
+    ip link set dev "$DEV" up 2>/dev/null || true
 
     return 0
 }
-
-
-renew_tethering() {
-    log "Stage 0: renew/up $NETIF Type=Ethernet Adapter Device=$PHYSDEV"
-
-    fix_uci_runtime
-
-    ubus call "network.interface.$NETIF" renew >/dev/null 2>&1 || true
-    sleep 2
-
-    ubus call "network.interface.$NETIF" up >/dev/null 2>&1 || true
-    ifup "$NETIF" 2>/dev/null || true
-
-    force_link_up "$PHYSDEV" "quiet" >/dev/null 2>&1 || true
-
-    wait_online 15
-}
-
-reboot_tethering() {
-    log "Stage 1: reboot $NETIF Type=Ethernet Adapter Device=$PHYSDEV"
-
-    fix_uci_runtime
-
-    # Turunkan logical interface OpenWrt.
-    ubus call "network.interface.$NETIF" down >/dev/null 2>&1 || true
-    ifdown "$NETIF" 2>/dev/null || true
-    sleep 2
-
-    # Turunkan dan naikkan ulang device wwan0.
-    if ip link show dev "$PHYSDEV" >/dev/null 2>&1; then
-        log "Stage 1: link down $PHYSDEV"
-        ip link set dev "$PHYSDEV" down 2>/dev/null || true
-        sleep 2
-
-        # Bersihkan IP lama agar DHCP/lease tidak nyangkut.
-        ip addr flush dev "$PHYSDEV" 2>/dev/null || true
-        sleep 1
-
-        log "Stage 1: link up $PHYSDEV"
-        ip link set dev "$PHYSDEV" up 2>/dev/null || true
-        sleep 2
-    else
-        log "Stage 1: device $PHYSDEV not found"
-    fi
-
-    # Naikkan logical interface lagi.
-    ubus call "network.interface.$NETIF" up >/dev/null 2>&1 || true
-    sleep 1
-
-    ifup "$NETIF" 2>/dev/null || true
-
-    wait_online 35
-}
-
-# ==================================================
-# CONNECTIVITY CHECK
-# ==================================================
 
 has_ip() {
     DEV="$(get_l3dev)"
@@ -351,12 +334,10 @@ ping_ok() {
     DEV="$(get_l3dev)"
 
     if [ -z "$DEV" ]; then
-        return 1
+        DEV="$PHYSDEV"
     fi
 
-    if ! ip link show dev "$DEV" >/dev/null 2>&1; then
-        return 1
-    fi
+    ip link show dev "$DEV" >/dev/null 2>&1 || return 1
 
     for HOST in $PING_TARGETS; do
         ping -I "$DEV" -c 1 -W 1 "$HOST" >/dev/null 2>&1 \
@@ -381,12 +362,10 @@ wait_online() {
         DEV="$(get_l3dev)"
 
         if [ -n "$DEV" ]; then
-            force_link_up "$DEV" "quiet" >/dev/null 2>&1 || true
+            link_up_quiet "$DEV" >/dev/null 2>&1 || true
         fi
 
-        if [ "$PHYSDEV" != "$DEV" ]; then
-            force_link_up "$PHYSDEV" "quiet" >/dev/null 2>&1 || true
-        fi
+        link_up_quiet "$PHYSDEV" >/dev/null 2>&1 || true
 
         if check_connectivity; then
             return 0
@@ -400,7 +379,59 @@ wait_online() {
 }
 
 # ==================================================
-# MODEMMANAGER
+# MAIN RECOVERY: REBOOT TETHERING / WWAN0
+# ==================================================
+
+renew_tethering() {
+    log "Stage 0: renew/up $NETIF"
+
+    fix_uci_runtime
+
+    ubus call "network.interface.$NETIF" renew >/dev/null 2>&1 || true
+    sleep 2
+
+    ubus call "network.interface.$NETIF" up >/dev/null 2>&1 || true
+    ifup "$NETIF" 2>/dev/null || true
+
+    link_up_quiet "$PHYSDEV" >/dev/null 2>&1 || true
+
+    wait_online 15
+}
+
+reboot_tethering() {
+    log "Stage 1: reboot interface $NETIF Type=Ethernet Adapter Device=$PHYSDEV"
+
+    fix_uci_runtime
+
+    ubus call "network.interface.$NETIF" down >/dev/null 2>&1 || true
+    ifdown "$NETIF" 2>/dev/null || true
+    sleep 2
+
+    if ip link show dev "$PHYSDEV" >/dev/null 2>&1; then
+        log "Stage 1: link down $PHYSDEV"
+        ip link set dev "$PHYSDEV" down 2>/dev/null || true
+        sleep 2
+
+        ip addr flush dev "$PHYSDEV" 2>/dev/null || true
+        sleep 1
+
+        log "Stage 1: link up $PHYSDEV"
+        ip link set dev "$PHYSDEV" up 2>/dev/null || true
+        sleep 2
+    else
+        log "Stage 1: device $PHYSDEV not found"
+    fi
+
+    ubus call "network.interface.$NETIF" up >/dev/null 2>&1 || true
+    sleep 1
+
+    ifup "$NETIF" 2>/dev/null || true
+
+    wait_online 35
+}
+
+# ==================================================
+# MODEMMANAGER FALLBACK
 # ==================================================
 
 get_mm_modem() {
@@ -451,9 +482,7 @@ mm_recover() {
     mmcli -m "$MM" --enable >/dev/null 2>&1 || true
     sleep 6
 
-    force_tethering_up
-
-    wait_online 40
+    reboot_tethering
 }
 
 mm_daemon_restart() {
@@ -477,9 +506,7 @@ mm_daemon_restart() {
         log "Stage MM daemon: modem not detected after restart"
     fi
 
-    force_tethering_up
-
-    wait_online 50
+    reboot_tethering
 }
 
 mm_reset_recover() {
@@ -495,7 +522,6 @@ mm_reset_recover() {
     log "Stage MM reset: mmcli --reset modem $MM"
 
     mmcli -m "$MM" --reset >/dev/null 2>&1 || true
-
     sleep 12
 
     MM="$(mm_wait_modem 35)"
@@ -504,13 +530,11 @@ mm_reset_recover() {
         mmcli -m "$MM" --enable >/dev/null 2>&1 || true
     fi
 
-    force_tethering_up
-
-    wait_online 55
+    reboot_tethering
 }
 
 # ==================================================
-# AT COMMAND
+# AT COMMAND FALLBACK
 # ==================================================
 
 at_cmd() {
@@ -565,9 +589,7 @@ soft_cfun_recover() {
     at_cmd "AT+CFUN=1" 5 || true
     sleep 4
 
-    force_tethering_up
-
-    wait_online 45
+    reboot_tethering
 }
 
 hard_cfun_recover() {
@@ -577,13 +599,11 @@ hard_cfun_recover() {
 
     wait_tty 35 || true
 
-    force_tethering_up
-
-    wait_online 60
+    reboot_tethering
 }
 
 # ==================================================
-# USB FALLBACK
+# USB / NETWORK / ROUTER FALLBACK
 # ==================================================
 
 usb_cycle() {
@@ -624,27 +644,17 @@ usb_cycle() {
         sleep 8
     fi
 
-    force_tethering_up
-
-    wait_online 60
+    reboot_tethering
 }
 
 network_service_restart() {
     log "Stage network: restarting network service"
 
     /etc/init.d/network restart >/dev/null 2>&1 || true
-
     sleep 10
 
-    force_tethering_up
-
-    wait_online 50
+    reboot_tethering
 }
-
-
-# ==================================================
-# ROUTER REBOOT FALLBACK
-# ==================================================
 
 get_uptime_seconds() {
     awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0
@@ -679,7 +689,7 @@ router_reboot_fallback() {
 }
 
 # ==================================================
-# STATE
+# STATE / STATUS
 # ==================================================
 
 get_fail_count() {
@@ -764,6 +774,21 @@ case "$1" in
         exit 0
         ;;
 
+    --cron-status)
+        cron_status
+        exit 0
+        ;;
+
+    --install-cron-test)
+        install_cron_test
+        exit 0
+        ;;
+
+    --remove-cron-test)
+        remove_cron_test
+        exit 0
+        ;;
+
     --fix-uci)
         fix_uci_persistent
         exit 0
@@ -791,9 +816,6 @@ esac
 
 log "=== Watchdog check started ==="
 
-# Tahap 0:
-# Jika koneksi masih sehat, jangan lakukan ifup/ubus up.
-# Ini mengurangi beban netifd, ModemManager, dan modem.
 if check_connectivity; then
     rm -f "$STATEFILE" "$COOLDOWNFILE"
     log "Connection healthy"
@@ -802,9 +824,6 @@ fi
 
 log "No connection detected on $NETIF/$PHYSDEV"
 
-# Tahap 1:
-# Karena interface di LuCI adalah Type=Ethernet Adapter Device=wwan0,
-# recovery utama adalah renew/up lalu reboot tethering.
 if renew_tethering; then
     rm -f "$STATEFILE" "$COOLDOWNFILE"
     log "RECOVERED via renew_tethering"
@@ -821,8 +840,6 @@ if reboot_tethering; then
     exit 0
 fi
 
-# Tahap 2:
-# Jika recovery ringan belum berhasil, baru hitung gagal berturut-turut.
 FAIL="$(get_fail_count)"
 FAIL=$((FAIL + 1))
 echo "$FAIL" > "$STATEFILE"
@@ -834,8 +851,6 @@ if [ "$FAIL" -lt "$FAILS_REQUIRED" ]; then
     exit 0
 fi
 
-# Tahap 3:
-# Cek cooldown agar modem tidak dihajar reset terus-menerus.
 NOW="$(date +%s)"
 LAST_COOLDOWN="$(get_last_cooldown)"
 
@@ -848,8 +863,6 @@ if [ "$LAST_COOLDOWN" -gt 0 ]; then
     fi
 fi
 
-# Tahap 4:
-# Deep recovery bertingkat.
 RECOVERED=0
 
 if mm_recover; then
